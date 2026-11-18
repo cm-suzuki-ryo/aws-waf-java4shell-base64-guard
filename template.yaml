@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Java4Shell (CVE-2026-114938) interim detection. Counts requests that carry a
+  malformed Base64 token (32+ chars, ends with "=", length not a multiple of 4)
+  in Authorization header, Cookie values, query string, or body.
+  Default action is Count. This is a stopgap, not a fix: patch the JDK or set
+  -XX:-UseBASE64Intrinsics.
+
+Parameters:
+  Scope:
+    Type: String
+    Default: REGIONAL
+    AllowedValues: [REGIONAL, CLOUDFRONT]
+    Description: >-
+      REGIONAL for ALB / API Gateway / AppSync etc. CLOUDFRONT must be deployed
+      in us-east-1.
+  RuleAction:
+    Type: String
+    Default: Count
+    AllowedValues: [Count, Block]
+    Description: Keep Count until the metrics show no false positives.
+  WebAclName:
+    Type: String
+    Default: java4shell-base64-count
+  AssociateResourceArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional. ARN of an ALB / API Gateway stage to attach this Web ACL to
+      (REGIONAL only). Attaching replaces any Web ACL already on that resource.
+      Leave empty to create the Web ACL only.
+
+Conditions:
+  IsBlock: !Equals [!Ref RuleAction, Block]
+  HasAssociation: !Not [!Equals [!Ref AssociateResourceArn, '']]
+
+Resources:
+  MalformedBase64Patterns:
+    Type: AWS::WAFv2::RegexPatternSet
+    Properties:
+      Name: !Sub '${WebAclName}-malformed-base64'
+      Scope: !Ref Scope
+      Description: Malformed Base64 token, 32 or more chars, ends with equals sign, bad padding
+      # Common prefix: token start (line start or non-alphabet char), then
+      # 32+ alphabet chars in groups of 4. Common suffix: end or non-alphabet.
+      # Entries cover the remainder (alphabet chars mod 4) and the "=" count:
+      #   0 chars + 1 or more "="
+      #   1 char  + 1 or more "="
+      #   2 chars + 1 or 3+ "="  (2 "=" is valid padding)
+      #   3 chars + 2 or more "=" (1 "=" is valid padding)
+      RegularExpressionList:
+        - '(?:^|[^A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{4}){8,}={1,}(?:$|[^A-Za-z0-9+/_=-])'
+        - '(?:^|[^A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{4}){8,}[A-Za-z0-9+/_-]={1,}(?:$|[^A-Za-z0-9+/_=-])'
+        - '(?:^|[^A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{4}){8,}[A-Za-z0-9+/_-]{2}(?:=|={3,})(?:$|[^A-Za-z0-9+/_=-])'
+        - '(?:^|[^A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{4}){8,}[A-Za-z0-9+/_-]{3}={2,}(?:$|[^A-Za-z0-9+/_=-])'
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Ref WebAclName
+      Scope: !Ref Scope
+      Description: Java4Shell malformed Base64 detection, interim
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${WebAclName}'
+      Rules:
+        - Name: MalformedBase64-AuthorizationHeader
+          Priority: 10
+          Action: !If [IsBlock, {Block: {}}, {Count: {}}]
+          Statement:
+            RegexPatternSetReferenceStatement:
+              Arn: !GetAtt MalformedBase64Patterns.Arn
+              FieldToMatch:
+                SingleHeader:
+                  Name: authorization
+              TextTransformations:
+                - Priority: 0
+                  Type: NONE
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${WebAclName}-authorization'
+
+        - Name: MalformedBase64-CookieValues
+          Priority: 20
+          Action: !If [IsBlock, {Block: {}}, {Count: {}}]
+          Statement:
+            RegexPatternSetReferenceStatement:
+              Arn: !GetAtt MalformedBase64Patterns.Arn
+              FieldToMatch:
+                Cookies:
+                  MatchPattern:
+                    All: {}
+                  MatchScope: VALUE
+                  OversizeHandling: CONTINUE
+              TextTransformations:
+                - Priority: 0
+                  Type: NONE
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${WebAclName}-cookie'
+
+        # Raw and URL-decoded forms are checked separately because URL_DECODE
+        # may turn a literal "+" into a space and split the token.
+        - Name: MalformedBase64-QueryString
+          Priority: 30
+          Action: !If [IsBlock, {Block: {}}, {Count: {}}]
+          Statement:
+            OrStatement:
+              Statements:
+                - RegexPatternSetReferenceStatement:
+                    Arn: !GetAtt MalformedBase64Patterns.Arn
+                    FieldToMatch:
+                      QueryString: {}
+                    TextTransformations:
+                      - Priority: 0
+                        Type: NONE
+                - RegexPatternSetReferenceStatement:
+                    Arn: !GetAtt MalformedBase64Patterns.Arn
+                    FieldToMatch:
+                      QueryString: {}
+                    TextTransformations:
+                      - Priority: 0
+                        Type: URL_DECODE
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${WebAclName}-query'
+
+        # Only the first part of the body is inspected (ALB: 8 KB fixed,
+        # CloudFront / API Gateway: 16 KB default, up to 64 KB configurable).
+        # CONTINUE keeps Count-mode metrics free of oversize noise. Do not
+        # switch to MATCH together with Block unless large uploads are
+        # acceptable to reject.
+        - Name: MalformedBase64-Body
+          Priority: 40
+          Action: !If [IsBlock, {Block: {}}, {Count: {}}]
+          Statement:
+            RegexPatternSetReferenceStatement:
+              Arn: !GetAtt MalformedBase64Patterns.Arn
+              FieldToMatch:
+                Body:
+                  OversizeHandling: CONTINUE
+              TextTransformations:
+                - Priority: 0
+                  Type: NONE
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${WebAclName}-body'
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: HasAssociation
+    Properties:
+      ResourceArn: !Ref AssociateResourceArn
+      WebACLArn: !GetAtt WebAcl.Arn
+
+Outputs:
+  WebAclArn:
+    Value: !GetAtt WebAcl.Arn
+  RegexPatternSetArn:
+    Value: !GetAtt MalformedBase64Patterns.Arn
