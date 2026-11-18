@@ -6,7 +6,7 @@ Java4Shell（CVE-2026-114938）のトリガーになる「不正な Base64 ト�
 
 **これは修正ではありません。** JDK を更新するか、JVM を `-XX:-UseBASE64Intrinsics` で起動してください。Wiz は、デコーダに到達するコード経路は多いため、WAF ルールで全経路を覆うのは難しく、自社開発アプリは完全には覆えないとしています: https://www.wiz.io/blog/cve-2026-114938-rce-java4shell-openjdk
 
-> **状態（2026-11-18）:** テンプレートは `cfn-lint` を通り、正規表現は `test/` のローカルテストを通っています。**AWS へのデプロイはまだ行っていません。** そのため、AWS WAF が正規表現を受け付けるか、各フィールドが想定どおり Count されるかは未確認です。「確認済みのこと・未確認のこと」を参照してください。
+> **状態（2026-11-18）:** ap-northeast-1 のテスト用 ALB（固定応答 200、HTTP）に、Count モードで一度デプロイして確認しました。AWS WAF は正規表現を受け付け、WAF ログで 4 つのフィールドが想定どおり Count されました。Block モード、HTTPS、8KB を超える body、CloudFront、API Gateway は**未確認**で、実際の脆弱な JVM に対する確認もしていません。「確認済みのこと・未確認のこと」を参照してください。
 
 ## Java4Shell の概要
 
@@ -67,6 +67,8 @@ aws cloudformation deploy \
 | `Scope` | `REGIONAL` | `REGIONAL`（ALB、API Gateway、AppSync など）か `CLOUDFRONT`。CloudFront は `us-east-1` にデプロイします。 |
 | `RuleAction` | `Count` | `Count` か `Block`。 |
 | `WebAclName` | `java4shell-base64-count` | メトリクス名の接頭辞にも使います。 |
+| `EnableLogging` | `false` | `true` にすると、CloudWatch Logs の log group `aws-waf-logs-<WebAclName>` を作り、Web ACL のログを送ります。`Authorization` と `Cookie` ヘッダーの値は伏せ字になります。URI とクエリ文字列は伏せ字にならないので、クエリ文字列のトークンはそのまま記録されます。 |
+| `LogRetentionInDays` | `7` | その log group の保持日数。 |
 | `AssociateResourceArn` | （空） | 空なら Web ACL だけを作ります。1 つのリソースに付けられる Web ACL は 1 つなので、関連付けると、すでに付いているものを**置き換えます**。先に確認してください。CloudFront の場合は、ディストリビューション側で Web ACL の ID を指定します。 |
 
 すでに Web ACL がある場合は、この Web ACL を付け替えるのではなく、4 つのルールとパターンセットをその Web ACL に追加してください。
@@ -83,31 +85,51 @@ aws cloudformation deploy \
 
 ## 確認済みのこと・未確認のこと
 
-確認済み（2026-11-18）:
-- `cfn-lint` が通る（`python:3.12` のコンテナで実行）。
-- `python3 test/test_patterns.py` が通る。一致すべき 13 件（トリガー文字列、各文字種、JSON、クエリ文字列、Cookie）と、一致すべきでない 10 件（正規のパディング、パディングなし、短いトークン、UUID、通常の文章）。
+2026-11-18 に確認しました。ap-northeast-1 の ALB（HTTP 80、固定応答 200）に、この Web ACL を `RuleAction=Count`、`EnableLogging=true` で付け、1 台の端末から `test/curl_checks.sh` でリクエストを送りました。Count モードなので、すべて 200 が返りました。WAF ログ（`nonTerminatingMatchingRules`）では次のとおりでした。
+
+| リクエスト | Count したルール |
+|---|---|
+| `Authorization: Basic` + `A` ×64 + `=` | `MalformedBase64-AuthorizationHeader` |
+| `Cookie: session=` + `A` ×64 + `=` | `MalformedBase64-CookieValues` |
+| `?t=` + `A` ×64 + `=`、および `%3D` にしたもの | `MalformedBase64-QueryString` |
+| トークンを含む POST body（`text/plain`、`application/x-www-form-urlencoded`、`application/json`。トークンのみ、`token=...`、`{"t":"..."}`、`x <トークン> y`） | `MalformedBase64-Body` |
+| トークンなしの GET、`-u user:pass`、正しいパディングの 36 文字、20 文字の不正トークン、JWT 風の Cookie | Count されない |
+
+`Authorization` と `Cookie` の値は `REDACTED` と記録されましたが、ルールの一致は記録されました。
+
+そのほかに、`cfn-lint` が通ること、`python3 test/test_patterns.py` が通ること（一致すべき 13 件、一致すべきでない 10 件）も確認しています。
+
+説明できていないこと: 最初に送った 13 件のうち、2 件（`text/plain` で `token=<トークン>` を送った POST と、JSON の POST）が WAF ログに残りませんでした。同じ形を、あとから `?id=` の目印を付けて送った 6 件は、すべて記録されて Count されました。原因は分かっていません。
 
 未確認:
-- デプロイと、AWS WAF による正規表現の受理（テストは Python の `re` を使っており、これらのパターンでは RE2 に近いものの、同じエンジンではありません）。
-- 実際の ALB で 4 つのフィールドが Count されること、実トラフィックでの誤検知の割合。
-- 実際の脆弱な JVM に対するルールの動作。
+- Block モードと、そのときの応答。
+- HTTPS リスナー、CloudFront、API Gateway。
+- 8KB を超える body と、`OversizeHandling: CONTINUE` の挙動。
+- CloudWatch メトリクス（`CountedRequests`）の値。サンプルリクエストでは、Authorization、Cookie、クエリ文字列の一致が出ることを確認しました。
+- 実トラフィックでの誤検知。
+- 実際の脆弱な JVM に対する動作。テスト用 ALB は固定応答なので、Java は動いていません。
+- AWS WAF が正規表現を受け付けることは、ap-northeast-1 でのみ確認しています。
 
 ## テスト
+
+ローカル（AWS は不要）:
 
 ```bash
 python3 test/test_patterns.py
 ```
 
-デプロイ後は、自分が所有するテスト用 ALB に、無害な不正トークン 1 件と正規のトークン 1 件を送り、CloudWatch のルールのメトリクス（`java4shell-base64-count-authorization` など）を比べます。まだ実行していません。
+AWS では、自分が所有するテスト用 ALB を使います（`test/alb-fixed-response.yaml` で作れます。HTTP 80、固定応答 200、1 つの CIDR にだけ公開）。
 
 ```bash
-# "A" ×64 + "=" : Count されるはず
-curl -i -H "Authorization: Basic $(printf 'A%.0s' {1..64})=" http://<alb-dns-name>/
-# 正規の Basic 認証 : Count されないはず
-curl -i -u user:pass http://<alb-dns-name>/
+aws cloudformation deploy --stack-name j4s-test-alb --template-file test/alb-fixed-response.yaml \
+  --parameter-overrides VpcId=vpc-xxxx SubnetIds=subnet-aaaa,subnet-bbbb AllowedCidr=<自分の IP>/32
+aws cloudformation deploy --stack-name j4s-test-waf --template-file template.yaml \
+  --parameter-overrides RuleAction=Count EnableLogging=true AssociateResourceArn=<ALB の ARN>
+bash test/curl_checks.sh <ALB の DNS 名>
+# その後、log group aws-waf-logs-java4shell-base64-count の nonTerminatingMatchingRules を確認する
 ```
 
-これらのリクエストは不正な文字列を含むだけです。ただし、脆弱な JVM では 1 つ目が、Calif の説明にある境界外書き込みを引き起こす可能性があります（Calif の PoC では配列内に収まる小さな上書きですが、稼働中のサービスでは実際のヒープ破壊です）。自分が所有するテスト環境にだけ送り、できれば `-XX:-UseBASE64Intrinsics` を付けた状態で試してください。
+`curl_checks.sh` が送るのは不正な文字列だけです。AVX-512 VBMI のホストで動く実際の Java サービスで、`-XX:-UseBASE64Intrinsics` を付けずに Base64 をデコードしているものには向けないでください。脆弱な JVM では、Calif が説明する境界外書き込みを引き起こす可能性があります。終わったら 2 つのスタックを削除してください。動いている間は課金されます。
 
 ## ライセンス
 

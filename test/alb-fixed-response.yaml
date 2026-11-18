@@ -1,0 +1,68 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Test ALB that returns a fixed 200 on HTTP 80. For trying the Java4Shell web
+  ACL only. Delete the stack when done.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Two or more public subnets in different Availability Zones.
+  AllowedCidr:
+    Type: String
+    Description: Source CIDR allowed to reach the ALB, for example 203.0.113.10/32.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+  WebAclArn:
+    Type: String
+    Default: ''
+    Description: Optional. Web ACL ARN (REGIONAL) to attach to the ALB.
+
+Conditions:
+  HasWebAcl: !Not [!Equals [!Ref WebAclArn, '']]
+
+Resources:
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Java4Shell test ALB, HTTP from one CIDR
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedCidr
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Subnets: !Ref SubnetIds
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: '200'
+            ContentType: text/plain
+            MessageBody: ok
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: HasWebAcl
+    Properties:
+      ResourceArn: !Ref Alb
+      WebACLArn: !Ref WebAclArn
+
+Outputs:
+  AlbDnsName:
+    Value: !GetAtt Alb.DNSName
+  AlbArn:
+    Value: !Ref Alb

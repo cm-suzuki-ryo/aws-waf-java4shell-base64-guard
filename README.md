@@ -6,7 +6,7 @@ An AWS WAF CloudFormation sample that **counts** (or blocks) requests carrying a
 
 **This is not a fix.** Patch the JDK, or start the JVM with `-XX:-UseBASE64Intrinsics`. Wiz says WAF rules are unlikely to cover every code path that reaches the decoder, and never cover home-grown applications completely: https://www.wiz.io/blog/cve-2026-114938-rce-java4shell-openjdk
 
-> **Status (2026-11-18):** the template passes `cfn-lint`, and the regular expressions pass the local tests in `test/`. **It has not been deployed to AWS yet**, so I have not confirmed that AWS WAF accepts the expressions or that each field is counted as intended. See "What is and is not verified".
+> **Status (2026-11-18):** deployed once to a test ALB (fixed 200 response, HTTP) in ap-northeast-1 in Count mode. AWS WAF accepted the expressions, and the WAF logs show each of the four fields counted as intended. Block mode, HTTPS, bodies over 8 KB, CloudFront and API Gateway are **not tested**, and nothing was run against a real vulnerable JVM. See "What is and is not verified".
 
 ## What Java4Shell is (short)
 
@@ -67,6 +67,8 @@ Start with `RuleAction=Count`, watch the CloudWatch metrics and sampled requests
 | `Scope` | `REGIONAL` | `REGIONAL` (ALB, API Gateway, AppSync, ...) or `CLOUDFRONT`. CloudFront must be deployed in `us-east-1`. |
 | `RuleAction` | `Count` | `Count` or `Block`. |
 | `WebAclName` | `java4shell-base64-count` | Also the metric name prefix. |
+| `EnableLogging` | `false` | `true` creates a CloudWatch Logs log group `aws-waf-logs-<WebAclName>` and sends web ACL logs to it. The `Authorization` and `Cookie` header values are redacted. The request URI and query string are not, so a token in the query string is logged. |
+| `LogRetentionInDays` | `7` | Retention of that log group. |
 | `AssociateResourceArn` | (empty) | Empty creates the web ACL only. A resource has one web ACL, so associating **replaces** the one already attached. Check first. For CloudFront, set the web ACL ID on the distribution instead. |
 
 If you already have a web ACL, add the four rules and the pattern set to it instead of attaching this one.
@@ -83,31 +85,51 @@ If you already have a web ACL, add the four rules and the pattern set to it inst
 
 ## What is and is not verified
 
-Verified (2026-11-18):
-- `cfn-lint` passes (run in a `python:3.12` container).
-- `python3 test/test_patterns.py` passes: 13 inputs that must match (trigger strings, the alphabets, JSON, query string, cookie) and 10 that must not (valid padding, unpadded, short tokens, UUID, plain text).
+Test on 2026-11-18: an ALB (HTTP 80, fixed response 200) in ap-northeast-1, this web ACL attached with `RuleAction=Count` and `EnableLogging=true`, requests sent with `test/curl_checks.sh` from one workstation. Every request returned 200, as expected in Count mode. In the WAF logs (`nonTerminatingMatchingRules`):
 
-Not verified:
-- Deployment, and acceptance of the regular expressions by AWS WAF (the tests use Python's `re`, which is close to RE2 for these patterns but not the same engine).
-- That the four fields are counted in a live ALB, and the false-positive rate on real traffic.
-- Behavior of the rules against a real vulnerable JVM.
+| Request | Counted by |
+|---|---|
+| `Authorization: Basic` + `A` x 64 + `=` | `MalformedBase64-AuthorizationHeader` |
+| `Cookie: session=` + `A` x 64 + `=` | `MalformedBase64-CookieValues` |
+| `?t=` + `A` x 64 + `=`, and the same with `%3D` | `MalformedBase64-QueryString` |
+| POST body with the token (`text/plain`, `application/x-www-form-urlencoded`, `application/json`; token alone, `token=...`, `{"t":"..."}`, `x <token> y`) | `MalformedBase64-Body` |
+| GET without a token, `-u user:pass`, a validly padded 36-character value, a 20-character malformed token, a JWT-like cookie | not counted |
+
+The `Authorization` and `Cookie` values were recorded as `REDACTED`; the rule match was still recorded.
+
+Also verified: `cfn-lint` passes, and `python3 test/test_patterns.py` passes (13 inputs that must match, 10 that must not).
+
+Not explained: of the first 13 requests, 2 (a `text/plain` POST with `token=<token>` and a JSON POST) did not appear in the WAF log. The same shapes sent later with an `?id=` marker (6 requests) were all logged and counted. I did not find the cause.
+
+Not tested:
+- Block mode and the response it returns.
+- HTTPS listeners, CloudFront and API Gateway.
+- Bodies over 8 KB, and the `OversizeHandling: CONTINUE` behavior.
+- The CloudWatch metric values (`CountedRequests`). Sampled requests showed the Authorization, Cookie and query string matches.
+- False positives on real traffic.
+- Behavior against a real vulnerable JVM. The test ALB returns a fixed response, so no Java ran.
+- Acceptance by AWS WAF is confirmed for ap-northeast-1 only.
 
 ## Test
+
+Local, no AWS needed:
 
 ```bash
 python3 test/test_patterns.py
 ```
 
-After deploying, with a test ALB you own, send one harmless malformed token and one valid token, then compare the rule metrics (`java4shell-base64-count-authorization` and so on) in CloudWatch. I have not run this yet.
+On AWS, with a test ALB you own (`test/alb-fixed-response.yaml` creates one: HTTP 80, fixed 200, open to one CIDR only):
 
 ```bash
-# 64 x "A" + "=" : should be counted
-curl -i -H "Authorization: Basic $(printf 'A%.0s' {1..64})=" http://<alb-dns-name>/
-# a valid Basic credential : should not be counted
-curl -i -u user:pass http://<alb-dns-name>/
+aws cloudformation deploy --stack-name j4s-test-alb --template-file test/alb-fixed-response.yaml \
+  --parameter-overrides VpcId=vpc-xxxx SubnetIds=subnet-aaaa,subnet-bbbb AllowedCidr=<your-ip>/32
+aws cloudformation deploy --stack-name j4s-test-waf --template-file template.yaml \
+  --parameter-overrides RuleAction=Count EnableLogging=true AssociateResourceArn=<alb-arn>
+bash test/curl_checks.sh <alb-dns-name>
+# then read the log group aws-waf-logs-java4shell-base64-count (nonTerminatingMatchingRules)
 ```
 
-These requests only carry a malformed string. On an affected JVM the first one can trigger the out-of-bounds write that Calif describes (bounded to a small overwrite in its PoC, but a real heap corruption in a live service). Send it only to a test environment you own, ideally with `-XX:-UseBASE64Intrinsics` set.
+`curl_checks.sh` sends a malformed string only. Do not point it at a real Java service that decodes Base64 on an AVX-512 VBMI host without `-XX:-UseBASE64Intrinsics`: on an affected JVM it can trigger the out-of-bounds write Calif describes. Delete both stacks when done; they cost money while they run.
 
 ## License
 

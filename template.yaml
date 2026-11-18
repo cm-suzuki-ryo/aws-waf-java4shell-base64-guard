@@ -29,8 +29,20 @@ Parameters:
       Optional. ARN of an ALB / API Gateway stage to attach this Web ACL to
       (REGIONAL only). Attaching replaces any Web ACL already on that resource.
       Leave empty to create the Web ACL only.
+  EnableLogging:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      true creates a CloudWatch Logs log group (aws-waf-logs-WebAclName) and
+      sends web ACL logs to it. Authorization and Cookie headers are redacted.
+  LogRetentionInDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
 
 Conditions:
+  LoggingEnabled: !Equals [!Ref EnableLogging, 'true']
   IsBlock: !Equals [!Ref RuleAction, Block]
   HasAssociation: !Not [!Equals [!Ref AssociateResourceArn, '']]
 
@@ -160,8 +172,31 @@ Resources:
       ResourceArn: !Ref AssociateResourceArn
       WebACLArn: !GetAtt WebAcl.Arn
 
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: LoggingEnabled
+    Properties:
+      LogGroupName: !Sub 'aws-waf-logs-${WebAclName}'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  WebAclLogging:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Condition: LoggingEnabled
+    Properties:
+      ResourceArn: !GetAtt WebAcl.Arn
+      LogDestinationConfigs:
+        - !GetAtt LogGroup.Arn
+      RedactedFields:
+        - SingleHeader:
+            Name: authorization
+        - SingleHeader:
+            Name: cookie
+
 Outputs:
   WebAclArn:
     Value: !GetAtt WebAcl.Arn
   RegexPatternSetArn:
     Value: !GetAtt MalformedBase64Patterns.Arn
+  LogGroupName:
+    Condition: LoggingEnabled
+    Value: !Ref LogGroup
